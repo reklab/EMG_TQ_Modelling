@@ -1,3 +1,9 @@
 *.asv
 *.fig
 *.mat
+__pycache__/
+.DS_Store
+*.keras
+*.h5
+*.pt
+ML/plots/
