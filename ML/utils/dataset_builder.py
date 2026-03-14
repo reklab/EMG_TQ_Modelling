@@ -8,11 +8,11 @@ Pipeline
 1.  Classify all trials by comment → MVC / passive / active
 2.  Extract EMG envelopes at 1000 Hz and normalize using MVC max per channel
 3.  Subtract mean passive torque per ankle position → net active torque
-4.  Downsample 1000 Hz → 100 Hz  (FIR anti-alias, zero-phase)
+4.  Downsample 1000 Hz → 100 Hz
 5.  Build sliding windows  [N × 20 × 5]
         Features : MG_env_norm, LG_env_norm, SOL_env_norm, TA_env_norm, position (rad)
-        Target   : active_torque (Nm) = measured_torque − mean_passive_torque
-6.  Temporal split per trial: 60 % train / 20 % val / 20 % test, then stack.
+        Target   : active_torque (Nm) = measured_torque − passive_torque
+6.  Temporal split per trial: 80 % train / 20 % validation and then retest trials as test
 
 Design choices
 --------------
@@ -43,9 +43,15 @@ DOWNSAMPLE_FACTOR = 10           # 1000 Hz → 100 Hz
 WINDOW_STEPS      = 20           # 20 steps × 10 ms = 200 ms history
 STRIDE_STEPS      = 1            # 1 step = 10 ms between predictions
 
-TRAIN_FRAC        = 0.60
+TRAIN_FRAC        = 0.80
 VAL_FRAC          = 0.20
-# TEST_FRAC       = 0.20  (implicit: 1 − TRAIN − VAL)
+# TEST_FRAC       = 0.00  (test comes from retest trials)
+
+# S3 (YES_281124.flb) trial indices — 1-indexed as in the FLB file
+# Test trials  → 80 % train / 20 % val
+# Retest trials → 100 % held-out test
+TEST_TRIAL_INDICES   = [11, 13, 15, 17, 19, 21, 23, 25]
+RETEST_TRIAL_INDICES = [27, 29, 31, 33, 35, 37, 39, 41]
 
 # Trials (active or passive) whose torque std exceeds this are passive
 # movement / ramp trials and are excluded from both the training set and
@@ -345,7 +351,6 @@ def build_dataset(trials,
                   window=WINDOW_STEPS,
                   stride=STRIDE_STEPS,
                   train_frac=TRAIN_FRAC,
-                  val_frac=VAL_FRAC,
                   subtract_passive=True):
     """
     Full pipeline: classify → MVC-normalize EMG → passive-subtract torque
@@ -361,8 +366,8 @@ def build_dataset(trials,
         1000 Hz / target Hz (default 10 → 100 Hz).
     window, stride : int
         Window length and step in samples at target Hz.
-    train_frac, val_frac : float
-        Temporal split fractions (test = 1 − train − val).
+    train_frac : float
+        Fraction of test trials used for training (rest → validation).
 
     Returns
     -------
@@ -406,20 +411,34 @@ def build_dataset(trials,
         print("  (none found — proceeding without passive subtraction)")
 
     # ── Steps 4–6: Per-trial downsample → window → split ─────────────────
+    # Convert 1-indexed trial numbers → 0-indexed for lookup
+    test_set   = {i - 1 for i in TEST_TRIAL_INDICES}
+    retest_set = {i - 1 for i in RETEST_TRIAL_INDICES}
+
     fs_target = 1000.0 / downsample_factor
     trains, vals, tests = [], [], []
 
     for df in active_trials:
+        idx = df.attrs.get('trial_index')
+
+        # Skip trials not in either set
+        if idx not in test_set and idx not in retest_set:
+            continue
+
         df_ds = downsample_trial(df, factor=downsample_factor)
         X, y  = build_windows(df_ds, emg_columns,
                               passive_entries if subtract_passive else None,
                               window=window, stride=stride)
-        (Xtr, ytr), (Xv, yv), (Xte, yte) = _temporal_split(X, y,
-                                                              train_frac,
-                                                              val_frac)
-        trains.append((Xtr, ytr))
-        vals.append((Xv,   yv))
-        tests.append((Xte, yte))
+
+        if idx in test_set:
+            # Test trial → 80 % train / 20 % val
+            (Xtr, ytr), (Xv, yv), _ = _temporal_split(
+                X, y, train_frac, 1.0 - train_frac)
+            trains.append((Xtr, ytr))
+            vals.append((Xv, yv))
+        else:
+            # Retest trial → 100 % held-out test
+            tests.append((X, y))
 
     X_train = np.concatenate([x for x, _ in trains])
     y_train = np.concatenate([y for _, y in trains])
@@ -428,6 +447,9 @@ def build_dataset(trials,
     X_test  = np.concatenate([x for x, _ in tests])
     y_test  = np.concatenate([y for _, y in tests])
 
+    print(f"\nTrial-based split:")
+    print(f"  Train/Val trials (1-indexed): {TEST_TRIAL_INDICES}")
+    print(f"  Test trials (retest, 1-indexed): {RETEST_TRIAL_INDICES}")
     print(f"\nDataset built at {fs_target:.0f} Hz  |  "
           f"window={window} steps ({window / fs_target * 1000:.0f} ms)  |  "
           f"stride={stride} step ({stride / fs_target * 1000:.0f} ms)")
