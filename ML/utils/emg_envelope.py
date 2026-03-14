@@ -67,11 +67,13 @@ def detect_emg_columns(df):
 def extract_envelope(signal, fs=DEFAULT_FS,
                      bp_low=DEFAULT_BP_LOW, bp_high=DEFAULT_BP_HIGH,
                      lp_cutoff=DEFAULT_LP_CUTOFF, order=DEFAULT_ORDER,
+                     demean=True,
                      return_intermediates=False):
     """
     Extract the linear envelope from a single raw EMG signal.
 
     Steps:
+        0. Demean (remove DC offset) — matches MATLAB ``demean.m``
         1. Bandpass filter (zero-phase Butterworth)
         2. Full-wave rectification  |x(t)|
         3. Lowpass filter (zero-phase Butterworth)
@@ -90,6 +92,9 @@ def extract_envelope(signal, fs=DEFAULT_FS,
         Lowpass cutoff in Hz for envelope extraction (default 2).
     order : int
         Butterworth filter order (default 4).
+    demean : bool
+        If True, subtract mean before filtering (default True).
+        Required for wireless EMG sensors with DC offset.
     return_intermediates : bool
         If True, also return the bandpass-filtered+rectified signal
         (``rectified``) alongside the envelope.
@@ -103,6 +108,11 @@ def extract_envelope(signal, fs=DEFAULT_FS,
         ``return_intermediates=True``.
     """
     signal = np.asarray(signal, dtype=np.float64)
+
+    # Step 0: Remove DC offset (matches MATLAB demean.m: y = x - mean(x))
+    if demean:
+        signal = signal - np.mean(signal)
+
     nyq = 0.5 * fs
 
     # Step 1: Bandpass filter
@@ -128,7 +138,8 @@ def extract_envelope(signal, fs=DEFAULT_FS,
 
 def compute_mvc_max(mvc_trials, emg_columns=None, fs=DEFAULT_FS,
                     bp_low=DEFAULT_BP_LOW, bp_high=DEFAULT_BP_HIGH,
-                    lp_cutoff=DEFAULT_LP_CUTOFF, order=DEFAULT_ORDER):
+                    lp_cutoff=DEFAULT_LP_CUTOFF, order=DEFAULT_ORDER,
+                    demean=True):
     """
     Compute per-channel envelope max values from MVC trials.
 
@@ -168,7 +179,8 @@ def compute_mvc_max(mvc_trials, emg_columns=None, fs=DEFAULT_FS,
         for df in mvc_trials:
             env = extract_envelope(df[col].values, fs=fs,
                                    bp_low=bp_low, bp_high=bp_high,
-                                   lp_cutoff=lp_cutoff, order=order)
+                                   lp_cutoff=lp_cutoff, order=order,
+                                   demean=demean)
             col_max = max(col_max, env.max())
         max_values[col] = col_max if col_max > 0 else 1.0
 
@@ -181,7 +193,8 @@ def compute_mvc_max(mvc_trials, emg_columns=None, fs=DEFAULT_FS,
 
 def process_trials(trials, emg_columns=None, max_values=None, fs=DEFAULT_FS,
                    bp_low=DEFAULT_BP_LOW, bp_high=DEFAULT_BP_HIGH,
-                   lp_cutoff=DEFAULT_LP_CUTOFF, order=DEFAULT_ORDER):
+                   lp_cutoff=DEFAULT_LP_CUTOFF, order=DEFAULT_ORDER,
+                   demean=True):
     """
     Process all trials for one subject: extract envelopes and normalize.
 
@@ -233,6 +246,7 @@ def process_trials(trials, emg_columns=None, max_values=None, fs=DEFAULT_FS,
             env, rect = extract_envelope(df[col].values, fs=fs,
                                          bp_low=bp_low, bp_high=bp_high,
                                          lp_cutoff=lp_cutoff, order=order,
+                                         demean=demean,
                                          return_intermediates=True)
             df[f'{col}_rect'] = rect
             df[f'{col}_env'] = env
@@ -261,7 +275,8 @@ def process_trials(trials, emg_columns=None, max_values=None, fs=DEFAULT_FS,
 
 def normalize_with_max(trials, max_values, emg_columns=None, fs=DEFAULT_FS,
                        bp_low=DEFAULT_BP_LOW, bp_high=DEFAULT_BP_HIGH,
-                       lp_cutoff=DEFAULT_LP_CUTOFF, order=DEFAULT_ORDER):
+                       lp_cutoff=DEFAULT_LP_CUTOFF, order=DEFAULT_ORDER,
+                       demean=True):
     """
     Extract envelopes and normalize trials using pre-computed max values.
 
@@ -293,6 +308,7 @@ def normalize_with_max(trials, max_values, emg_columns=None, fs=DEFAULT_FS,
             env, rect = extract_envelope(df[col].values, fs=fs,
                                          bp_low=bp_low, bp_high=bp_high,
                                          lp_cutoff=lp_cutoff, order=order,
+                                         demean=demean,
                                          return_intermediates=True)
             df[f'{col}_rect'] = rect
             df[f'{col}_env'] = env

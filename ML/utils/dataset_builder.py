@@ -24,6 +24,7 @@ Design choices
 """
 
 import re
+import warnings
 import numpy as np
 import pandas as pd
 from scipy.signal import decimate
@@ -42,16 +43,18 @@ TORQUE_COL        = 'torque'     # measured torque column name (Nm)
 DOWNSAMPLE_FACTOR = 10           # 1000 Hz → 100 Hz
 WINDOW_STEPS      = 20           # 20 steps × 10 ms = 200 ms history
 STRIDE_STEPS      = 1            # 1 step = 10 ms between predictions
+TRANSIENT_SAMPLES = 1000         # samples to trim from start of each trial at 1000 Hz
+                                 # (1 s — discards EMG envelope filter startup artifact)
 
 TRAIN_FRAC        = 0.80
 VAL_FRAC          = 0.20
 # TEST_FRAC       = 0.00  (test comes from retest trials)
 
-# S3 (YES_281124.flb) trial indices — 1-indexed as in the FLB file
+# Example trial indices for S3 (YES_281124.flb) — 1-indexed as in the FLB file
 # Test trials  → 80 % train / 20 % val
 # Retest trials → 100 % held-out test
-TEST_TRIAL_INDICES   = [11, 13, 15, 17, 19, 21, 23, 25]
-RETEST_TRIAL_INDICES = [27, 29, 31, 33, 35, 37, 39, 41]
+S3_TEST_TRIAL_INDICES   = [11, 13, 15, 17, 19, 21, 23, 25]
+S3_RETEST_TRIAL_INDICES = [27, 29, 31, 33, 35, 37, 39, 41]
 
 # Trials (active or passive) whose torque std exceeds this are passive
 # movement / ramp trials and are excluded from both the training set and
@@ -68,23 +71,35 @@ def _parse_comment(comment: str):
     Returns
     -------
     trial_type : 'mvc' | 'passive' | 'active'
+    session    : 'test' | 'retest' | None
     position   : 'p1' .. 'p8'  (or None)
     """
     comment = comment.lower().strip()
     m = re.search(r'p(\d+)', comment)
     pos = m.group(0) if m else None
 
-    if comment.startswith('mvc'):
-        return 'mvc', pos
-    elif 'passive' in comment:
-        return 'passive', pos
+    # Determine session (retest must be checked before test)
+    if 'retest' in comment:
+        session = 'retest'
+    elif 'test' in comment or 'repeat' in comment:
+        session = 'test'
     else:
-        return 'active', pos
+        session = None
+
+    if comment.startswith('mvc'):
+        return 'mvc', session, pos
+    elif 'passive' in comment:
+        return 'passive', session, pos
+    else:
+        return 'active', session, pos
 
 
 def classify_trials(trials):
     """
     Split trial DataFrames into MVC, passive, and active groups.
+
+    Also tags each DataFrame with ``attrs['session']`` ('test', 'retest',
+    or None) parsed from the trial comment.
 
     Parameters
     ----------
@@ -97,7 +112,8 @@ def classify_trials(trials):
     """
     mvc, passive, active = [], [], []
     for df in trials:
-        t_type, _ = _parse_comment(df.attrs.get('comment', ''))
+        t_type, session, _ = _parse_comment(df.attrs.get('comment', ''))
+        df.attrs['session'] = session
         if t_type == 'mvc':
             mvc.append(df)
         elif t_type == 'passive':
@@ -201,17 +217,28 @@ def get_passive_torque_map(passive_trials, position_col=POSITION_COL,
         else:
             clusters.append((pos, tq, 1))
 
-    return [(pos, tq) for pos, tq, _ in clusters]
+    entries = [(pos, tq) for pos, tq, _ in clusters]
+    if len(entries) < 2:
+        warnings.warn(
+            f"Only {len(entries)} passive torque entry/entries found. "
+            f"Extrapolation will be limited to constant value.",
+            stacklevel=2,
+        )
+    return entries
 
 
 def _extrapolate(positions, torques, x):
     """Linear extrapolation beyond the measured range of passive positions."""
+    if len(positions) < 2:
+        return float(torques[0]) if len(torques) > 0 else 0.0
     if x < positions[0]:
         p0, p1 = positions[0], positions[1]
         t0, t1 = torques[0],   torques[1]
     else:
         p0, p1 = positions[-2], positions[-1]
         t0, t1 = torques[-2],   torques[-1]
+    if abs(p1 - p0) < 1e-12:
+        return float(t0)
     slope = (t1 - t0) / (p1 - p0)
     return float(t0 + slope * (x - p0))
 
@@ -347,13 +374,16 @@ def _temporal_split(X, y, train_frac=TRAIN_FRAC, val_frac=VAL_FRAC):
 
 def build_dataset(trials,
                   emg_columns=None,
+                  test_trial_indices=None,
+                  retest_trial_indices=None,
+                  norm_method='global_max',
                   downsample_factor=DOWNSAMPLE_FACTOR,
                   window=WINDOW_STEPS,
                   stride=STRIDE_STEPS,
                   train_frac=TRAIN_FRAC,
                   subtract_passive=True):
     """
-    Full pipeline: classify → MVC-normalize EMG → passive-subtract torque
+    Full pipeline: classify → normalize EMG → passive-subtract torque
                    → downsample → sliding windows → temporal split → stack.
 
     Parameters
@@ -361,7 +391,17 @@ def build_dataset(trials,
     trials : list of pd.DataFrame
         All trials from ``read_flb`` (MVC + passive + active).
     emg_columns : list of str, optional
-        EMG column names. Auto-detected from the first MVC trial if None.
+        EMG column names. Auto-detected from the first trial if None.
+    test_trial_indices : list of int, optional
+        1-indexed trial numbers for train/val split (80/20).
+        If None, auto-detected from comments containing 'test' (not 'retest').
+    retest_trial_indices : list of int, optional
+        1-indexed trial numbers for held-out test set.
+        If None, auto-detected from comments containing 'retest'.
+    norm_method : str
+        ``'global_max'`` — normalize by global max across active trials
+        (matches MATLAB default).
+        ``'mvc'`` — normalize by MVC trial peaks.
     downsample_factor : int
         1000 Hz / target Hz (default 10 → 100 Hz).
     window, stride : int
@@ -374,7 +414,7 @@ def build_dataset(trials,
     X_train, y_train : np.ndarray
     X_val,   y_val   : np.ndarray
     X_test,  y_test  : np.ndarray
-    mvc_max          : dict  {emg_col: global_max_from_mvc_trials}
+    emg_max          : dict  {emg_col: max_value_used_for_normalization}
     passive_entries  : list of (position_rad, passive_torque_Nm)
     """
     # ── Step 1: Classify ──────────────────────────────────────────────────
@@ -390,16 +430,24 @@ def build_dataset(trials,
 
     if not active_trials:
         raise ValueError("No active trials found.")
-    if not mvc_trials:
-        raise ValueError("No MVC trials found — cannot normalize EMG.")
 
-    # ── Step 2: EMG envelope extraction + MVC normalization ───────────────
-    _, mvc_max = process_trials(mvc_trials, emg_columns=emg_columns)
-    if emg_columns is None:
-        emg_columns = list(mvc_max.keys())
-
-    active_trials = normalize_with_max(active_trials, mvc_max,
-                                       emg_columns=emg_columns)
+    # ── Step 2: EMG envelope extraction + normalization ───────────────────
+    if norm_method == 'mvc':
+        if not mvc_trials:
+            raise ValueError("No MVC trials found — cannot normalize with 'mvc' method.")
+        _, emg_max = process_trials(mvc_trials, emg_columns=emg_columns)
+        if emg_columns is None:
+            emg_columns = list(emg_max.keys())
+        active_trials = normalize_with_max(active_trials, emg_max,
+                                           emg_columns=emg_columns)
+    elif norm_method == 'global_max':
+        # Normalize by global max across all active trials (matches MATLAB default)
+        active_trials, emg_max = process_trials(active_trials,
+                                                 emg_columns=emg_columns)
+        if emg_columns is None:
+            emg_columns = list(emg_max.keys())
+    else:
+        raise ValueError(f"Unknown norm_method: {norm_method!r}. Use 'mvc' or 'global_max'.")
 
     # ── Step 3: Passive torque lookup (position-based) ────────────────────
     passive_entries = get_passive_torque_map(passive_trials)
@@ -411,9 +459,54 @@ def build_dataset(trials,
         print("  (none found — proceeding without passive subtraction)")
 
     # ── Steps 4–6: Per-trial downsample → window → split ─────────────────
-    # Convert 1-indexed trial numbers → 0-indexed for lookup
-    test_set   = {i - 1 for i in TEST_TRIAL_INDICES}
-    retest_set = {i - 1 for i in RETEST_TRIAL_INDICES}
+    # Determine which active trials go to train/val vs held-out test.
+    # If explicit indices are provided, use them; otherwise auto-detect
+    # from the 'session' tag parsed from trial comments.
+    if test_trial_indices is not None and retest_trial_indices is not None:
+        test_set   = {i - 1 for i in test_trial_indices}
+        retest_set = {i - 1 for i in retest_trial_indices}
+    else:
+        test_set, retest_set = set(), set()
+        for df in active_trials:
+            idx = df.attrs.get('trial_index')
+            session = df.attrs.get('session')
+            if session == 'retest':
+                retest_set.add(idx)
+            elif session == 'test':
+                test_set.add(idx)
+        if not test_set:
+            raise ValueError("No test-session active trials found in comments.")
+        print(f"\nAuto-detected trial split from comments:")
+        print(f"  Train/Val (test session):  {sorted(i+1 for i in test_set)}")
+        print(f"  Held-out  (retest session): {sorted(i+1 for i in retest_set)}")
+
+    # Determine which positions have retest coverage so we can fall back
+    # to a 3-way split (60/20/20) for test-session trials at positions
+    # without retest data.
+    retest_positions = set()
+    for df in active_trials:
+        idx = df.attrs.get('trial_index')
+        if idx in retest_set:
+            _, _, pos_tag = _parse_comment(df.attrs.get('comment', ''))
+            if pos_tag:
+                retest_positions.add(pos_tag)
+
+    test_session_positions = {}  # position_tag → trial_index for test-session trials
+    for df in active_trials:
+        idx = df.attrs.get('trial_index')
+        if idx in test_set:
+            _, _, pos_tag = _parse_comment(df.attrs.get('comment', ''))
+            if pos_tag:
+                test_session_positions[idx] = pos_tag
+
+    # Positions that need fallback test data from the test session
+    fallback_indices = {idx for idx, pos_tag in test_session_positions.items()
+                        if pos_tag not in retest_positions}
+    if fallback_indices:
+        print(f"\n  Positions without retest data: "
+              f"{sorted(test_session_positions[i] for i in fallback_indices)}")
+        print(f"  → Using 60/20/20 split on test-session trials "
+              f"{sorted(i+1 for i in fallback_indices)} to get test data")
 
     fs_target = 1000.0 / downsample_factor
     trains, vals, tests = [], [], []
@@ -425,17 +518,29 @@ def build_dataset(trials,
         if idx not in test_set and idx not in retest_set:
             continue
 
+        # Trim filter transient from start of trial (1 s at 1000 Hz)
+        df = df.iloc[TRANSIENT_SAMPLES:].reset_index(drop=True)
+
         df_ds = downsample_trial(df, factor=downsample_factor)
         X, y  = build_windows(df_ds, emg_columns,
                               passive_entries if subtract_passive else None,
                               window=window, stride=stride)
 
         if idx in test_set:
-            # Test trial → 80 % train / 20 % val
-            (Xtr, ytr), (Xv, yv), _ = _temporal_split(
-                X, y, train_frac, 1.0 - train_frac)
-            trains.append((Xtr, ytr))
-            vals.append((Xv, yv))
+            if idx in fallback_indices:
+                # No retest for this position → 60 % train / 20 % val / 20 % test
+                (Xtr, ytr), (Xv, yv), (Xte, yte) = _temporal_split(
+                    X, y, 0.60, 0.20)
+                trains.append((Xtr, ytr))
+                vals.append((Xv, yv))
+                if len(Xte) > 0:
+                    tests.append((Xte, yte))
+            else:
+                # Retest exists for this position → 80 % train / 20 % val
+                (Xtr, ytr), (Xv, yv), _ = _temporal_split(
+                    X, y, train_frac, 1.0 - train_frac)
+                trains.append((Xtr, ytr))
+                vals.append((Xv, yv))
         else:
             # Retest trial → 100 % held-out test
             tests.append((X, y))
@@ -448,8 +553,11 @@ def build_dataset(trials,
     y_test  = np.concatenate([y for _, y in tests])
 
     print(f"\nTrial-based split:")
-    print(f"  Train/Val trials (1-indexed): {TEST_TRIAL_INDICES}")
-    print(f"  Test trials (retest, 1-indexed): {RETEST_TRIAL_INDICES}")
+    print(f"  Train/Val trials (1-indexed): {sorted(i+1 for i in test_set)}")
+    if retest_set:
+        print(f"  Test trials (retest, 1-indexed): {sorted(i+1 for i in retest_set)}")
+    if fallback_indices:
+        print(f"  Test trials (fallback 20%, 1-indexed): {sorted(i+1 for i in fallback_indices)}")
     print(f"\nDataset built at {fs_target:.0f} Hz  |  "
           f"window={window} steps ({window / fs_target * 1000:.0f} ms)  |  "
           f"stride={stride} step ({stride / fs_target * 1000:.0f} ms)")
@@ -459,4 +567,4 @@ def build_dataset(trials,
     print(f"  X_val    : {X_val.shape}   y_val:   {y_val.shape}")
     print(f"  X_test   : {X_test.shape}   y_test:  {y_test.shape}")
 
-    return X_train, y_train, X_val, y_val, X_test, y_test, mvc_max, passive_entries
+    return X_train, y_train, X_val, y_val, X_test, y_test, emg_max, passive_entries

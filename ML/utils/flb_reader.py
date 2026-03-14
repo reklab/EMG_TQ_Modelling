@@ -42,10 +42,16 @@ import pandas as pd
 
 
 # ── Channel name map (MATLAB is 1-indexed, Python 0-indexed) ─────────────
-DEFAULT_CHANNEL_NAMES = ['pos', 'tq', 'gm', 'gl', 'sol', 'ta']
+DEFAULT_CHANNEL_NAMES = ['position', 'torque', 'gm', 'gl', 'sol', 'ta']
 
 # IES01 subject has a different channel order in the raw file
 IES01_CHANNEL_ORDER = [0, 1, 3, 5, 4, 2]   # reorder to: pos, tq, gm, gl, sol, ta
+
+# Map common short names to canonical names used throughout the pipeline
+_CANONICAL_NAMES = {
+    'pos': 'position',
+    'tq': 'torque',
+}
 
 
 # ── Low-level binary helpers ──────────────────────────────────────────────
@@ -199,13 +205,19 @@ def read_flb(filepath, subject_id='default', channel_names=None):
             # Reorder channels for IES01
             if subject_id.upper() == 'IES01' and data.shape[1] >= 6:
                 data = data[:, IES01_CHANNEL_ORDER]
-
-            # Use channel names from the file header if available, else defaults
-            file_chan_names = h.get('chanName', [])
-            if file_chan_names and all(c not in ('DEFAULT', '') for c in file_chan_names):
-                col_names = [c.lower().replace(' ', '_') for c in file_chan_names]
-            else:
+                # After reorder, data matches DEFAULT_CHANNEL_NAMES order
+                # (pos, tq, gm, gl, sol, ta) — ignore file header names
                 col_names = channel_names
+            else:
+                # Use channel names from the file header if available, else defaults
+                file_chan_names = h.get('chanName', [])
+                if file_chan_names and all(c not in ('DEFAULT', '') for c in file_chan_names):
+                    col_names = [c.lower().replace(' ', '_') for c in file_chan_names]
+                else:
+                    col_names = channel_names
+
+            # Normalize to canonical names (e.g. 'pos' -> 'position')
+            col_names = [_CANONICAL_NAMES.get(c, c) for c in col_names]
 
             n_ch = min(data.shape[1], len(col_names))
             df = pd.DataFrame(data[:, :n_ch], columns=col_names[:n_ch])

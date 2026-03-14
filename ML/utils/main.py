@@ -50,28 +50,32 @@ except ImportError:
 
 # Per-channel display names and units (two separate strings for two-line y-label)
 CHANNEL_META = {
-    'pos':     ('position',  'rad'),
-    'tq':      ('torque',    'Nm'),
-    'gm':      ('gm_emg',    'mV'),
-    'gl':      ('gl_emg',    'mV'),
-    'sol':     ('sol_emg',   'mV'),
-    'ta':      ('ta_emg',    'mV'),
+    'position': ('position',  'rad'),
+    'torque':   ('torque',    'Nm'),
+    'gm':       ('gm_emg',    'mV'),
+    'gl':       ('gl_emg',    'mV'),
+    'sol':      ('sol_emg',   'mV'),
+    'ta':       ('ta_emg',    'mV'),
 }
 
 # One distinct colour per channel (matches reference image)
 CHANNEL_COLORS = {
-    'pos': '#1f77b4',   # blue
-    'tq':  '#d62728',   # red
-    'gm':  '#2ca02c',   # dark green
-    'gl':  '#ff7f0e',   # orange
-    'sol': '#9467bd',   # purple
-    'ta':  '#8c564b',   # brown
+    'position': '#1f77b4',   # blue
+    'torque':   '#d62728',   # red
+    'gm':       '#2ca02c',   # dark green
+    'gl':       '#ff7f0e',   # orange
+    'sol':      '#9467bd',   # purple
+    'ta':       '#8c564b',   # brown
 }
+
+# Aliases for backward compatibility with old short names
+_NAME_ALIASES = {'pos': 'position', 'tq': 'torque'}
 
 
 def _ch_label(col: str):
     """Return (name, unit) for y-axis label."""
-    return CHANNEL_META.get(col.lower(), (col, ''))
+    key = _NAME_ALIASES.get(col.lower(), col.lower())
+    return CHANNEL_META.get(key, (col, ''))
 
 
 # Ordered fallback palette — applied positionally when name doesn't match
@@ -80,7 +84,8 @@ _COLOR_PALETTE = list(CHANNEL_COLORS.values())
 
 def _ch_color(col: str, idx: int = 0) -> str:
     """Return the hex colour for a channel by name, then by index."""
-    c = CHANNEL_COLORS.get(col.lower())
+    key = _NAME_ALIASES.get(col.lower(), col.lower())
+    c = CHANNEL_COLORS.get(key)
     if c:
         return c
     return _COLOR_PALETTE[idx % len(_COLOR_PALETTE)]
@@ -286,6 +291,10 @@ def main():
                         help='Skip CSV export.')
     parser.add_argument('--no_plots', action='store_true',
                         help='Skip plot generation.')
+    parser.add_argument('--test-trials', nargs='+', type=int, default=None,
+                        help='1-indexed test trial numbers (default: auto-detect)')
+    parser.add_argument('--retest-trials', nargs='+', type=int, default=None,
+                        help='1-indexed retest trial numbers (default: auto-detect)')
     args = parser.parse_args()
 
     flb_path = os.path.abspath(args.flb_file)
@@ -341,8 +350,10 @@ def main():
         print(f"Saved trial-{t_idx+1} plot     → '{trial_path}'")
 
     # ── Build dataset (classify → envelopes → passive subtract → windows) ─
-    X_train, y_train, X_val, y_val, X_test, y_test, mvc_max, passive_entries = \
-        build_dataset(trials)
+    X_train, y_train, X_val, y_val, X_test, y_test, emg_max, passive_entries = \
+        build_dataset(trials,
+                      test_trial_indices=args.test_trials,
+                      retest_trial_indices=args.retest_trials)
 
     print("\n── Dataset quality checks ──────────────────────────────────────")
     print(f"  NaN in inputs : {np.isnan(X_train).any()}")
