@@ -2,3 +2,12 @@
 *.fig
 *.mat
 *.mldatx
+__pycache__/
+.DS_Store
+*.keras
+*.h5
+*.pt
+*.flb
+ML/plots/
+ML/*_output/
+.venv/
